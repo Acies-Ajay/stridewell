@@ -62,67 +62,87 @@ def genie_client():
     return WorkspaceClient(config=Config())
 
 
-def _id_of(obj, *names):
+def _get(obj, *names):
+    """Read the first present attribute/key.
+
+    SDK result objects raise KeyError for attributes absent from the response
+    (their __getattr__ does not honour getattr defaults), and attachment
+    payloads can arrive as plain dicts, so try both access paths.
+    """
     for name in names:
-        value = getattr(obj, name, None)
-        if value:
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            value = None
+        if value is None and isinstance(obj, dict):
+            value = obj.get(name)
+        if value is not None:
             return value
     return None
 
 
-def _message_text(message):
-    text = getattr(message, "text_content", None)
-    if text:
-        return text
-    parts = [chunk.text for chunk in (getattr(message, "content", None) or [])
-             if getattr(chunk, "text", None)]
+def _message_text(message, question=None):
+    """Genie returns the narrative answer in text attachments; fall back safely."""
+    parts = []
+    for attachment in (_get(message, "attachments") or []):
+        text_obj = _get(attachment, "text")
+        content = _get(text_obj, "content") if text_obj is not None else None
+        if content:
+            parts.append(content)
+    if not parts:
+        text = _get(message, "text_content")
+        if text:
+            parts.append(text)
+        content = _get(message, "content")
+        if isinstance(content, str) and content.strip() and content.strip() != (question or "").strip():
+            parts.append(content)
     return "\n".join(parts)
 
 
 def _status_of(message):
-    status = getattr(message, "status", None)
-    return getattr(status, "value", status)
+    status = _get(message, "status")
+    value = _get(status, "value")
+    return value or status
 
 
 def ask_genie(question):
     """Ask the Stridewell Genie agent. Returns (answer_text, sql_text)."""
     genie = genie_client().genie
     started = genie.start_conversation(GENIE_SPACE_ID, content=question)
-    conversation = getattr(started, "conversation", None) or started
-    conversation_id = _id_of(conversation, "conversation_id", "id")
-    message = getattr(started, "message", None)
+    conversation = _get(started, "conversation") or started
+    conversation_id = _get(conversation, "conversation_id", "id")
+    message = _get(started, "message")
     if message is None:
         message = genie.create_message(GENIE_SPACE_ID, conversation_id, content=question)
-    message_id = _id_of(message, "message_id", "id")
-    for _ in range(60):
+    message_id = _get(message, "message_id", "id")
+    terminal = ("COMPLETED", "FAILED", "CANCELLED")
+    for _ in range(90):
         message = genie.get_message(GENIE_SPACE_ID, conversation_id, message_id)
-        status = _status_of(message)
-        if status and status != "PENDING":
+        if _status_of(message) in terminal:
             break
         time.sleep(2)
     status = _status_of(message)
-    if status == "FAILED":
-        return "The assistant could not answer that question. Try rephrasing it.", None
-    if status != "COMPLETED":
-        return "The assistant did not finish in time. Please ask again.", None
+    answer_parts = []
     sql_text = None
-    for attachment in (getattr(message, "attachments", None) or []):
-        if getattr(attachment, "query", None) is None:
-            continue
-        try:
-            result = genie.get_message_attachment_query_result(
-                GENIE_SPACE_ID, conversation_id, message_id, _id_of(attachment, "attachment_id", "id"))
-            query = getattr(result, "query", None)
-            for field in ("query_text", "query", "statement", "text"):
-                candidate = getattr(query, field, None)
+    for attachment in (_get(message, "attachments") or []):
+        text_obj = _get(attachment, "text")
+        text_content = _get(text_obj, "content") if text_obj is not None else None
+        if text_content:
+            answer_parts.append(text_content)
+        query_obj = _get(attachment, "query")
+        if query_obj is not None and sql_text is None:
+            for field in ("query", "query_text", "statement"):
+                candidate = _get(query_obj, field)
                 if isinstance(candidate, str) and candidate.strip():
                     sql_text = candidate
                     break
-            if sql_text:
-                break
-        except Exception:
-            logging.warning("Genie query result fetch failed", exc_info=True)
-    return _message_text(message) or "No answer was returned for that question.", sql_text
+    if status == "FAILED":
+        return "The assistant could not answer that question. Try rephrasing it.", sql_text
+    if status != "COMPLETED":
+        return "The assistant did not finish in time. Please ask again.", sql_text
+    if not answer_parts:
+        answer_parts.append(_message_text(message, question))
+    return "\n".join(answer_parts) or "No answer was returned for that question.", sql_text
 
 
 def executive():
