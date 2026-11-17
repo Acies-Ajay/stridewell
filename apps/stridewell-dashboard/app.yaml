@@ -4,3 +4,5 @@ env:
     valueFrom: sql-warehouse
   - name: STRIDEWELL_CATALOG
     value: sw_dev_ajay
+  - name: GENIE_SPACE_ID
+    value: 01f1e26bce711f9ebe8a1833624a3c24

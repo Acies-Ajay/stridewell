@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import time
 from datetime import timedelta, datetime, timezone
 from urllib.parse import urlparse
 
@@ -9,11 +10,13 @@ import plotly.express as px
 from ui import style, hero, insight, plot, bars, details, COLORS, inr, context
 import streamlit as st
 from databricks import sql
+from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config
 
 st.set_page_config(page_title="Stridewell", page_icon="📊", layout="wide")
 CATALOG = os.getenv("STRIDEWELL_CATALOG", "sw_dev_ajay")
 WAREHOUSE = os.getenv("DATABRICKS_WAREHOUSE_ID", "")
+GENIE_SPACE_ID = os.getenv("GENIE_SPACE_ID", "")
 if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", CATALOG):
     st.error("Invalid catalog configuration.")
     st.stop()
@@ -52,6 +55,74 @@ def table(schema, name):
     if (schema, name) not in allowed:
         raise ValueError("Source table is not allowed")
     return ".".join((CATALOG, schema, name))
+
+
+@st.cache_resource
+def genie_client():
+    return WorkspaceClient(config=Config())
+
+
+def _id_of(obj, *names):
+    for name in names:
+        value = getattr(obj, name, None)
+        if value:
+            return value
+    return None
+
+
+def _message_text(message):
+    text = getattr(message, "text_content", None)
+    if text:
+        return text
+    parts = [chunk.text for chunk in (getattr(message, "content", None) or [])
+             if getattr(chunk, "text", None)]
+    return "\n".join(parts)
+
+
+def _status_of(message):
+    status = getattr(message, "status", None)
+    return getattr(status, "value", status)
+
+
+def ask_genie(question):
+    """Ask the Stridewell Genie agent. Returns (answer_text, sql_text)."""
+    genie = genie_client().genie
+    started = genie.start_conversation(GENIE_SPACE_ID, content=question)
+    conversation = getattr(started, "conversation", None) or started
+    conversation_id = _id_of(conversation, "conversation_id", "id")
+    message = getattr(started, "message", None)
+    if message is None:
+        message = genie.create_message(GENIE_SPACE_ID, conversation_id, content=question)
+    message_id = _id_of(message, "message_id", "id")
+    for _ in range(60):
+        message = genie.get_message(GENIE_SPACE_ID, conversation_id, message_id)
+        status = _status_of(message)
+        if status and status != "PENDING":
+            break
+        time.sleep(2)
+    status = _status_of(message)
+    if status == "FAILED":
+        return "The assistant could not answer that question. Try rephrasing it.", None
+    if status != "COMPLETED":
+        return "The assistant did not finish in time. Please ask again.", None
+    sql_text = None
+    for attachment in (getattr(message, "attachments", None) or []):
+        if getattr(attachment, "query", None) is None:
+            continue
+        try:
+            result = genie.get_message_attachment_query_result(
+                GENIE_SPACE_ID, conversation_id, message_id, _id_of(attachment, "attachment_id", "id"))
+            query = getattr(result, "query", None)
+            for field in ("query_text", "query", "statement", "text"):
+                candidate = getattr(query, field, None)
+                if isinstance(candidate, str) and candidate.strip():
+                    sql_text = candidate
+                    break
+            if sql_text:
+                break
+        except Exception:
+            logging.warning("Genie query result fetch failed", exc_info=True)
+    return _message_text(message) or "No answer was returned for that question.", sql_text
 
 
 def executive():
@@ -463,6 +534,37 @@ def quality():
 
 
 
+def ask_ai():
+    if not GENIE_SPACE_ID:
+        st.info("The AI assistant is not configured yet. Add GENIE_SPACE_ID in app.yaml and redeploy.")
+        return
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    for role, text, sql in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.markdown(text)
+            if sql:
+                st.caption("Query the assistant ran")
+                st.code(sql, language="sql")
+    question = st.chat_input("Ask about Stridewell sales, inventory, stock coverage or reconciliation…")
+    if question:
+        st.session_state.chat_history.append(("user", question, None))
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("Analysing Stridewell data…"):
+                try:
+                    answer, sql_text = ask_genie(question)
+                except Exception:
+                    logging.exception("Genie assistant call failed")
+                    answer, sql_text = ("The assistant is unavailable right now. Check the Genie space sharing and warehouse access, then try again.", None)
+            st.markdown(answer)
+            if sql_text:
+                st.caption("Query the assistant ran")
+                st.code(sql_text, language="sql")
+        st.session_state.chat_history.append(("assistant", answer, sql_text))
+
+
 def requirements():
     st.markdown("### Find the answer you need")
     st.caption("This map describes the capabilities present in your uploaded application. It is not a claim that every original case-study requirement is complete.")
@@ -518,7 +620,7 @@ with refresh:
         query.clear()
         st.session_state.refreshed_at=datetime.now(timezone.utc).strftime("%H:%M UTC")
 style()
-page=st.radio("Navigate workspace",["Executive","Overview","Sales","Inventory","Stock Coverage","Data Quality","Reconciliation","Guide"],horizontal=True,key="main_nav",label_visibility="collapsed")
+page=st.radio("Navigate workspace",["Executive","Overview","Sales","Inventory","Stock Coverage","Data Quality","Reconciliation","Guide","Ask AI"],horizontal=True,key="main_nav",label_visibility="collapsed")
 headings={
     "Executive":("A clear view of your business.","Revenue, channel performance, inventory exposure and financial exceptions — together in one executive view."),
     "Overview":("Understand the sales story.","Start with the big picture. See how sales move, which channels contribute and where demand is strongest."),
@@ -527,12 +629,15 @@ headings={
     "Stock Coverage":("Focus on stock that needs review.","Inspect your pipeline's stock statuses, then explore demand and coverage by store and product."),
     "Data Quality":("Understand what needs fixing.","See retained validation issues by source and reason, with searchable evidence for investigation."),
     "Reconciliation":("Make financial differences visible.","Review stored gold-versus-ERP exceptions. Identify the most frequent differences before investigating the source."),
-    "Guide":("Every page has a purpose.","Find the business question, the right view, and the meaning behind each result.")}
+    "Guide":("Every page has a purpose.","Find the business question, the right view, and the meaning behind each result."),
+    "Ask AI":("Ask your data, directly.","A conversational assistant over your Stridewell tables — ask a business question in plain language and get an answer, with the query behind it.")}
 hero(*headings[page])
 if st.session_state.get("refreshed_at"):
     st.caption("Cache cleared at "+st.session_state.refreshed_at+" · business dates are shown separately below")
 if page=="Guide":
     requirements()
+elif page=="Ask AI":
+    ask_ai()
 elif not WAREHOUSE:
     st.warning("Data connection is not configured. Attach your SQL warehouse as sql-warehouse and redeploy. No business results have been loaded.")
 else:
